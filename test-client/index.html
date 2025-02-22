@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Test Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 0 20px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .message-log {
+            height: 300px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px 0;
+            background-color: #f8f9fa;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            padding: 8px 16px;
+            margin: 5px;
+            cursor: pointer;
+        }
+        #fileInput {
+            margin: 10px 0;
+        }
+        .error {
+            color: #721c24;
+            background-color: #f8d7da;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .audio-controls {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+        }
+        .audio-status {
+            margin: 5px 0;
+            font-style: italic;
+        }
+        .video-container {
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+        #videoPreview {
+            width: 100%;
+            max-width: 640px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .video-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin: 10px 0;
+        }
+        .mode-switch {
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Test Client</h1>
+    
+    <div id="connectionStatus" class="status disconnected">
+        Disconnected
+    </div>
+
+    <div class="mode-switch">
+        <label>
+            <input type="radio" name="mode" value="image" checked> Image Mode
+        </label>
+        <label>
+            <input type="radio" name="mode" value="video"> Video Mode
+        </label>
+    </div>
+
+    <div class="controls">
+        <button onclick="connect()">Connect</button>
+        <button onclick="disconnect()">Disconnect</button>
+    </div>
+
+    <div id="imageMode">
+        <input type="file" id="fileInput" accept="image/*" onchange="handleFileSelect(event)">
+        <button onclick="sendImage()">Send Image</button>
+        <div id="imageInfo"></div>
+    </div>
+
+    <div id="videoMode" style="display: none;">
+        <div class="video-container">
+            <video id="videoPreview" autoplay playsinline muted></video>
+            <div class="video-controls">
+                <button onclick="startVideo()">Start Camera</button>
+                <button onclick="stopVideo()">Stop Camera</button>
+                <button onclick="toggleVideoStream()" id="streamToggle" disabled>Start Streaming</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="audio-controls">
+        <div class="audio-status" id="audioStatus">No audio playing</div>
+        <audio id="audioPlayer" controls style="display: none;"></audio>
+    </div>
+
+    <div class="message-log" id="messageLog"></div>
+
+    <script>
+        let ws = null;
+        let selectedFile = null;
+        let reconnectAttempts = 0;
+        let isStreamingVideo = false;
+        let videoStream = null;
+        let frameInterval = null;
+        const maxReconnectAttempts = 5;
+        let pingInterval = null;
+        let audioChunks = [];
+        let isStreamingAudio = false;
+        let isFeedbackGenerating = false;
+
+        // Handle mode switching
+        document.querySelectorAll('input[name="mode"]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                const isVideo = e.target.value === 'video';
+                document.getElementById('imageMode').style.display = isVideo ? 'none' : 'block';
+                document.getElementById('videoMode').style.display = isVideo ? 'block' : 'none';
+                if (!isVideo) {
+                    stopVideo();
+                }
+            });
+        });
+
+        async function startVideo() {
+            try {
+                const constraints = {
+                    video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        frameRate: { ideal: 30 }
+                    }
+                };
+                
+                videoStream = await navigator.mediaDevices.getUserMedia(constraints);
+                const videoElement = document.getElementById('videoPreview');
+                videoElement.srcObject = videoStream;
+                document.getElementById('streamToggle').disabled = false;
+                log('Camera started successfully');
+            } catch (error) {
+                log('Error accessing camera: ' + error.message);
+            }
+        }
+
+        function stopVideo() {
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+                videoStream = null;
+                document.getElementById('videoPreview').srcObject = null;
+                document.getElementById('streamToggle').disabled = true;
+            }
+            if (frameInterval) {
+                clearInterval(frameInterval);
+                frameInterval = null;
+            }
+            isStreamingVideo = false;
+            document.getElementById('streamToggle').textContent = 'Start Streaming';
+            log('Video stream stopped');
+        }
+
+        function toggleVideoStream() {
+            if (!videoStream) {
+                log('Please start the camera first');
+                return;
+            }
+
+            if (!isStreamingVideo) {
+                startVideoStream();
+            } else {
+                stopVideoStream();
+            }
+        }
+
+        function startVideoStream() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('Not connected to WebSocket server');
+                return;
+            }
+
+            isStreamingVideo = true;
+            document.getElementById('streamToggle').textContent = 'Stop Streaming';
+            
+            const videoElement = document.getElementById('videoPreview');
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = videoElement.videoWidth;
+            canvas.height = videoElement.videoHeight;
+
+            frameInterval = setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN && videoStream && videoStream.active && !isFeedbackGenerating) {
+                    isFeedbackGenerating = true;
+                    ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+                    canvas.toBlob((blob) => {
+                        if (blob) {
+                            ws.send(blob);
+                        }
+                    }, 'image/jpeg', 0.8);
+                }
+            }, 100); // Send frames more frequently than server processing rate
+
+            log('Started video streaming');
+        }
+
+        function stopVideoStream() {
+            if (frameInterval) {
+                clearInterval(frameInterval);
+                frameInterval = null;
+            }
+            isStreamingVideo = false;
+            document.getElementById('streamToggle').textContent = 'Start Streaming';
+            log('Stopped video streaming');
+        }
+
+        function connect() {
+            if (ws) {
+                log('Already connected');
+                return;
+            }
+
+            try {
+                const isVideoMode = document.querySelector('input[name="mode"]:checked').value === 'video';
+                const endpoint = isVideoMode ? 'video-stream' : 'exercise-analysis';
+                log('Attempting to connect...');
+                ws = new WebSocket(`ws://localhost:8000/ws/${endpoint}/test-client-1`);
+                
+                ws.onopen = () => {
+                    document.getElementById('connectionStatus').className = 'status connected';
+                    document.getElementById('connectionStatus').textContent = 'Connected';
+                    log('Connected to WebSocket server');
+                    reconnectAttempts = 0;
+                    
+                    pingInterval = setInterval(() => {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type: 'ping' }));
+                            log('Ping sent');
+                        }
+                    }, 30000);
+                };
+
+                ws.onclose = (event) => {
+                    document.getElementById('connectionStatus').className = 'status disconnected';
+                    document.getElementById('connectionStatus').textContent = 'Disconnected';
+                    log('Disconnected from WebSocket server');
+                    log(`Close code: ${event.code}, Reason: ${event.reason}`);
+                    
+                    if (pingInterval) {
+                        clearInterval(pingInterval);
+                        pingInterval = null;
+                    }
+                    
+                    stopVideoStream();
+                    ws = null;
+
+                    if (reconnectAttempts < maxReconnectAttempts) {
+                        reconnectAttempts++;
+                        log(`Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts})...`);
+                        setTimeout(connect, 2000);
+                    }
+                };
+
+                ws.onmessage = (event) => {
+                    if (event.data instanceof Blob) {
+                        log('Received binary data of type: ' + event.data.type);
+                        handleAudioData(event.data);
+                    } else {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'error') {
+                                isFeedbackGenerating = false;
+                                log(`Error: ${data.data}`);
+                                const messageLog = document.getElementById('messageLog');
+                                const errorDiv = document.createElement('div');
+                                errorDiv.className = 'error';
+                                errorDiv.textContent = data.data;
+                                messageLog.appendChild(errorDiv);
+                            } else if (['stream_start', 'stream_end'].includes(data.type)) {
+                                handleAudioData(data);
+                            } else {
+                                isFeedbackGenerating = false;
+                                log(`Received: ${JSON.stringify(data, null, 2)}`);
+                            }
+                        } catch (e) {
+                            if (isStreamingAudio) {
+                                handleAudioData(event.data);
+                            } else {
+                                log('Received: ' + event.data);
+                            }
+                            isFeedbackGenerating = false;
+                        }
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    log('WebSocket Error: ' + (error.message || 'Unknown error'));
+                };
+            } catch (error) {
+                log('Connection Error: ' + error.message);
+            }
+        }
+
+        function disconnect() {
+            stopVideoStream();
+            if (ws) {
+                reconnectAttempts = maxReconnectAttempts;
+                if (pingInterval) {
+                    clearInterval(pingInterval);
+                    pingInterval = null;
+                }
+                ws.close(1000, 'Client initiated disconnect');
+            }
+        }
+
+        function log(message) {
+            const messageLog = document.getElementById('messageLog');
+            const timestamp = new Date().toLocaleTimeString();
+            messageLog.innerHTML += `<div>[${timestamp}] ${message}</div>`;
+            messageLog.scrollTop = messageLog.scrollHeight;
+        }
+
+        function updateAudioStatus(status) {
+            document.getElementById('audioStatus').textContent = status;
+        }
+
+        function handleAudioData(data) {
+            if (data instanceof Blob) {
+                log('Received audio blob of size: ' + data.size + ' bytes');
+                playAudioBlob(new Blob([data], { type: 'audio/mpeg' }));
+            } else {
+                try {
+                    const message = JSON.parse(data);
+                    if (message.type === 'stream_start') {
+                        log('Audio stream starting...');
+                        audioChunks = [];
+                        isStreamingAudio = true;
+                        updateAudioStatus('Receiving audio stream...');
+                    } else if (message.type === 'stream_end') {
+                        log('Audio stream complete');
+                        isStreamingAudio = false;
+                        if (audioChunks.length > 0) {
+                            const audioBlob = new Blob(audioChunks, { type: 'audio/mpeg' });
+                            log('Created audio blob from stream, size: ' + audioBlob.size + ' bytes');
+                            playAudioBlob(audioBlob);
+                            audioChunks = [];
+                        } else {
+                            log('Warning: No audio chunks received in stream');
+                        }
+                        updateAudioStatus('Audio stream complete');
+                    }
+                } catch (e) {
+                    if (isStreamingAudio) {
+                        log('Received audio chunk of size: ' + data.size + ' bytes');
+                        audioChunks.push(data);
+                    } else {
+                        log('Received unexpected binary data');
+                    }
+                }
+            }
+        }
+
+        function playAudioBlob(blob) {
+            const audioPlayer = document.getElementById('audioPlayer');
+            const audioUrl = URL.createObjectURL(blob);
+            
+            log('Creating audio player with blob size: ' + blob.size + ' bytes');
+            audioPlayer.src = audioUrl;
+            audioPlayer.style.display = 'block';
+            
+            updateAudioStatus('Playing audio feedback...');
+            
+            audioPlayer.oncanplay = () => {
+                log('Audio is ready to play');
+                audioPlayer.play().catch(error => {
+                    log('Error auto-playing audio: ' + error.message);
+                    updateAudioStatus('Click play to hear feedback');
+                });
+            };
+            
+            audioPlayer.onended = () => {
+                log('Audio playback complete');
+                URL.revokeObjectURL(audioUrl);
+                updateAudioStatus('Audio playback complete');
+            };
+            
+            audioPlayer.onerror = (e) => {
+                log('Audio error: ' + (audioPlayer.error ? audioPlayer.error.message : 'Unknown error'));
+                URL.revokeObjectURL(audioUrl);
+                updateAudioStatus('Error playing audio');
+            };
+        }
+
+        function handleFileSelect(event) {
+            selectedFile = event.target.files[0];
+            const imageInfo = document.getElementById('imageInfo');
+            
+            if (selectedFile) {
+                if (selectedFile.size > 5 * 1024 * 1024) { // 5MB limit
+                    log('Warning: File size exceeds 5MB, this may cause issues');
+                    imageInfo.textContent = 'Warning: Large file size';
+                    imageInfo.style.color = '#856404';
+                } else {
+                    imageInfo.textContent = `Selected: ${selectedFile.name} (${(selectedFile.size/1024).toFixed(2)}KB)`;
+                    imageInfo.style.color = '#155724';
+                }
+                log(`File selected: ${selectedFile.name} (${(selectedFile.size/1024).toFixed(2)}KB)`);
+            } else {
+                imageInfo.textContent = '';
+            }
+        }
+
+        async function sendImage() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('Not connected to WebSocket server');
+                return;
+            }
+
+            if (!selectedFile) {
+                log('No file selected');
+                return;
+            }
+
+            if (isFeedbackGenerating) {
+                log('Please wait for the current feedback to complete');
+                return;
+            }
+
+            try {
+                isFeedbackGenerating = true;
+                const compressedImage = await compressImage(selectedFile);
+                log(`Image compressed: ${(compressedImage.size/1024).toFixed(2)}KB`);
+                
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    try {
+                        const base64Image = e.target.result.split(',')[1];
+                        ws.send(base64Image);
+                        log('Sent image: ' + selectedFile.name);
+                    } catch (error) {
+                        isFeedbackGenerating = false;
+                        log('Error sending image: ' + error.message);
+                    }
+                };
+                reader.onerror = function(error) {
+                    isFeedbackGenerating = false;
+                    log('Error reading file: ' + error.message);
+                };
+                reader.readAsDataURL(compressedImage);
+            } catch (error) {
+                isFeedbackGenerating = false;
+                log('Error processing image: ' + error.message);
+            }
+        }
+
+        async function compressImage(file) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    let width = img.width;
+                    let height = img.height;
+                    
+                    // Calculate new dimensions while maintaining aspect ratio
+                    const maxDimension = 800;
+                    if (width > height && width > maxDimension) {
+                        height = (height * maxDimension) / width;
+                        width = maxDimension;
+                    } else if (height > maxDimension) {
+                        width = (width * maxDimension) / height;
+                        height = maxDimension;
+                    }
+                    
+                    canvas.width = width;
+                    canvas.height = height;
+                    
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, width, height);
+                    
+                    canvas.toBlob((blob) => {
+                        resolve(new File([blob], file.name, {
+                            type: 'image/jpeg',
+                            lastModified: Date.now()
+                        }));
+                    }, 'image/jpeg', 0.8);
+                };
+                img.onerror = reject;
+                img.src = URL.createObjectURL(file);
+            });
+        }
+    </script>
+</body>
+</html> 
