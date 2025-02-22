@@ -15,6 +15,7 @@ class WebSocketRouter:
     def __init__(self, manager: ConnectionManager, vision_service: VisionService):
         self.manager = manager
         self.vision_service = vision_service
+        self.logger = logging.getLogger(__name__)
 
     async def handle_exercise_analysis(
         self,
@@ -184,171 +185,104 @@ class WebSocketRouter:
         exercise_type: str = None,
         audio_enabled: bool = True
     ):
+        """
+        Handle video stream WebSocket connection.
+        
+        Args:
+            websocket: The WebSocket connection
+            client_id: Unique identifier for the client
+            exercise_type: Type of exercise being performed
+            audio_enabled: Whether to generate audio feedback
+        """
         try:
-            logger.info(f"Attempting video stream WebSocket connection for client_id: {client_id}")
             await websocket.accept()
-            logger.info(f"WebSocket accepted for client_id: {client_id}")
-            
             await self.manager.connect(websocket, client_id)
-            
-            if exercise_type:
-                self.manager.update_exercise_type(client_id, exercise_type)
-            
-            self.manager.toggle_audio(client_id, audio_enabled)
-            last_process_time = 0
-            is_disconnected = False
-            
+            self.logger.info(f"Started video stream for client {client_id}")
+
             try:
-                while not is_disconnected:
+                while True:
                     try:
+                        # Receive the message
                         message = await websocket.receive()
-                    except WebSocketDisconnect:
-                        logger.info(f"Video stream disconnected for client_id: {client_id}")
-                        is_disconnected = True
-                        break
-                    
-                    # Check if this is a control message
-                    if message.get('type') == 'websocket.receive' and 'text' in message:
-                        try:
-                            control_data = json.loads(message['text'])
-                            if isinstance(control_data, dict):
-                                if control_data.get('type') == 'stop_session':
-                                    logger.info(f"Received stop session request from client_id: {client_id}")
-                                    session = self.manager.user_sessions.get(client_id)
-                                    if session:
-                                        session.is_active = False
-                                    await websocket.send_text(json.dumps({
-                                        "type": "session_stopped",
-                                        "data": "Session stopped successfully"
-                                    }))
-                                    continue
-                                elif control_data.get('type') == 'start_session':
-                                    logger.info(f"Received start session request from client_id: {client_id}")
-                                    session = self.manager.user_sessions.get(client_id)
-                                    if session:
-                                        session.is_active = True
-                                    await websocket.send_text(json.dumps({
-                                        "type": "session_started",
-                                        "data": "Session started successfully"
-                                    }))
-                                    continue
-                                elif control_data.get('type') == 'pause_session':
-                                    logger.info(f"Received pause session request from client_id: {client_id}")
-                                    session = self.manager.user_sessions.get(client_id)
-                                    if session:
-                                        session.is_active = False
-                                    await websocket.send_text(json.dumps({
-                                        "type": "session_paused",
-                                        "data": "Session paused successfully"
-                                    }))
-                                    continue
-                                elif control_data.get('type') == 'resume_session':
-                                    logger.info(f"Received resume session request from client_id: {client_id}")
-                                    session = self.manager.user_sessions.get(client_id)
-                                    if session:
-                                        session.is_active = True
-                                    await websocket.send_text(json.dumps({
-                                        "type": "session_resumed",
-                                        "data": "Session resumed successfully"
-                                    }))
-                                    continue
-                        except json.JSONDecodeError:
-                            pass  # Not a JSON message, treat as frame data
-                    
-                    current_time = time.time() * 1000
-                    session = self.manager.user_sessions.get(client_id)
-                    
-                    # Only process frames if session is active and enough time has passed
-                    if session and session.is_active and current_time - last_process_time >= 1000:
-                        if message.get('type') == 'websocket.receive':
-                            try:
-                                if isinstance(message.get('bytes'), bytes):
-                                    frame_data = base64.b64encode(message.get('bytes')).decode('utf-8')
-                                elif 'text' in message:
-                                    frame_data = message.get('text', '')
-                                else:
-                                    logger.error(f"Unsupported message format from client_id: {client_id}")
-                                    continue
+                        message_type = message.get('type', '')
+                        
+                        # Check for disconnect message first
+                        if message_type == 'websocket.disconnect':
+                            self.logger.info(f"Received disconnect message from client {client_id}")
+                            break
 
-                                current_exercise = session.exercise_type
-                                
-                                logger.info(f"Processing video frame for client_id: {client_id}")
-                                feedback_text = await self.vision_service.analyze_frame(frame_data, current_exercise)
-                                
-                                if not session.is_active:
-                                    logger.info(f"Session no longer active, skipping feedback for client_id: {client_id}")
-                                    continue
+                        self.logger.debug(f"Received message type: {message_type} from client {client_id}")
 
-                                if feedback_text and not feedback_text.startswith("Error analyzing frame"):
-                                    feedback_data = {
-                                        "timestamp": datetime.now().isoformat(),
-                                        "feedback": feedback_text,
-                                        "exercise_type": current_exercise,
-                                        "audio_available": self.manager.can_generate_audio(client_id)
-                                    }
+                        # Handle different message types
+                        if message_type == 'websocket.receive':
+                            if 'bytes' in message:
+                                frame_data = message['bytes']
+                                # Process the frame with vision service
+                                self.logger.debug(f"Processing frame for client {client_id}, size: {len(frame_data)} bytes")
+                                feedback = await self.vision_service.analyze_frame(
+                                    frame_data,
+                                    exercise_type=exercise_type,
+                                    user_id=client_id
+                                )
+                                
+                                if audio_enabled and feedback:
+                                    # Generate audio feedback
+                                    self.logger.debug(f"Generating audio feedback for client {client_id}")
+                                    audio_data = await self.manager.audio_manager.generate_feedback(feedback)
                                     
-                                    self.manager.add_feedback(client_id, feedback_data)
-                                    session.last_activity = datetime.now()
-                                    
-                                    if session.is_active:
+                                    if audio_data and isinstance(audio_data, bytes):
+                                        # Send audio back to client
+                                        self.logger.debug(f"Sending audio feedback to client {client_id}, size: {len(audio_data)} bytes")
                                         try:
-                                            await self.manager.send_message(
-                                                json.dumps(feedback_data),
-                                                client_id,
-                                                "text"
-                                            )
-                                        
-                                            if self.manager.can_generate_audio(client_id):
-                                                try:
-                                                    logger.info(f"Generating audio feedback for video frame")
-                                                    audio_data = await self.manager.audio_manager.generate_feedback(
-                                                        feedback_text,
-                                                        session.voice_id,
-                                                        session.voice_settings
-                                                    )
-                                                    if audio_data and session.is_active:
-                                                        logger.info(f"Sending audio feedback of size {len(audio_data)} bytes")
-                                                        await self.manager.send_audio(audio_data, client_id)
-                                                    else:
-                                                        logger.info("Skipping audio feedback - session not active or no audio data")
-                                                except Exception as audio_e:
-                                                    logger.error(f"Error generating audio for video frame: {str(audio_e)}")
-                                                    if session.is_active:
-                                                        await websocket.send_text(json.dumps({
-                                                            "type": "error",
-                                                            "data": "Failed to generate audio feedback"
-                                                        }))
-                                        except WebSocketDisconnect:
-                                            logger.info(f"Client disconnected while sending feedback: {client_id}")
-                                            is_disconnected = True
-                                            break
-                                
-                                last_process_time = current_time
-                                
-                            except Exception as frame_e:
-                                logger.error(f"Error processing video frame: {str(frame_e)}")
+                                            await websocket.send_bytes(audio_data)
+                                            self.logger.debug("Audio feedback sent successfully")
+                                        except Exception as send_error:
+                                            self.logger.error(f"Error sending audio feedback: {str(send_error)}")
+                                    else:
+                                        self.logger.warning(f"No valid audio data generated for client {client_id}")
+                            else:
                                 try:
-                                    await websocket.send_text(json.dumps({
-                                        "type": "error",
-                                        "data": f"Error processing frame: {str(frame_e)}"
-                                    }))
-                                except WebSocketDisconnect:
-                                    logger.info(f"Client disconnected while sending error: {client_id}")
-                                    is_disconnected = True
-                                    break
-                
-            except WebSocketDisconnect:
-                logger.info(f"Video stream disconnected for client_id: {client_id}")
+                                    # Try to parse as JSON control message
+                                    text_data = message.get('text', '{}')
+                                    control_message = json.loads(text_data)
+                                    if isinstance(control_message, dict):
+                                        msg_type = control_message.get('type')
+                                        if msg_type in ['start_session', 'stop_session', 'pause_session', 'resume_session']:
+                                            self.logger.info(f"Received control message {msg_type} from client {client_id}")
+                                            # Handle session state changes here if needed
+                                except json.JSONDecodeError:
+                                    self.logger.error(f"Received message without bytes from client {client_id}: {message}")
+                        else:
+                            self.logger.warning(f"Unexpected message type from client {client_id}: {message_type}")
+                    
+                    except WebSocketDisconnect:
+                        self.logger.info(f"WebSocket disconnect detected for client {client_id}")
+                        break
+                    except Exception as frame_error:
+                        self.logger.error(
+                            f"Error processing frame for client {client_id}: {str(frame_error)}\n"
+                            f"Error type: {type(frame_error).__name__}\n"
+                            f"Traceback: {traceback.format_exc()}"
+                        )
+                        # Don't disconnect, try to continue with next frame
+                        continue
+                    
             finally:
-                self.manager.disconnect(client_id)
-                logger.info(f"Cleaned up session for client_id: {client_id}")
+                # Always clean up the connection
+                self.logger.info(f"Cleaning up connection for client {client_id}")
+                await self.manager.disconnect(websocket, client_id)
                 
-        except Exception as outer_e:
-            logger.error(f"Error during video stream setup for client_id: {client_id}: {str(outer_e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+        except Exception as e:
+            self.logger.error(
+                f"Error setting up video stream for client {client_id}: {str(e)}\n"
+                f"Error type: {type(e).__name__}\n"
+                f"Traceback: {traceback.format_exc()}"
+            )
             try:
-                await websocket.close(code=1011, reason=str(outer_e))
+                await websocket.close(code=1011)
             except:
                 pass
             finally:
-                self.manager.disconnect(client_id) 
+                await self.manager.disconnect(websocket, client_id)
+
+    # ... rest of the existing code ... 
