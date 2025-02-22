@@ -32,7 +32,7 @@ class AudioFeedbackManager:
                 # Get the generator from ElevenLabs
                 audio_generator = self.client.text_to_speech.convert(
                     text=text,
-                    voice_id=voice_id,
+                    voice_id="IAZxNqwaUCKERlavhDxB",
                     model_id="eleven_multilingual_v2",
                     output_format="mp3_44100_128",
                     voice_settings={

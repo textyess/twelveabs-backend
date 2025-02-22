@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from app.core.config import settings
 
@@ -11,6 +11,7 @@ class UserSession:
         self.is_active: bool = True
         self.last_activity: datetime = datetime.now()
         self.voice_id: str = settings.DEFAULT_VOICE_ID
-        self.voice_settings: dict = settings.DEFAULT_VOICE_SETTINGS.copy()
+        self.voice_settings: Dict[str, Any] = settings.DEFAULT_VOICE_SETTINGS.copy()
         self.audio_enabled: bool = True
-        self.last_feedback_time: Optional[datetime] = None 
+        self.last_feedback_time: Optional[datetime] = None
+        self.is_processing = False  # Flag to control feedback generation 

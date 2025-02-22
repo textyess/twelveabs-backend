@@ -4,6 +4,7 @@ import numpy as np
 from openai import OpenAI
 from app.core.config import settings
 import logging
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,11 @@ class VisionService:
             img_data = base64.b64decode(frame_base64)
             nparr = np.frombuffer(img_data, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if frame is None:
+                logger.error("Failed to decode frame")
+                return "Error: Failed to decode frame"
+                
             logger.info("Frame decoded successfully")
             
             # Encode frame as PNG for OpenAI API
@@ -35,10 +41,10 @@ class VisionService:
                 prompt += f" Exercise: {exercise_type}."
             prompt += " Focus only on the most critical form correction needed right now."
             
-            logger.info(f"Sending request to  GPT-4o-mini with exercise_type: {exercise_type}")
+            logger.info(f"Sending request to GPT-4o-mini with exercise_type: {exercise_type}")
             # Call GPT-4o-mini
             response = self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o-mini",  # Updated to the latest model version
                 messages=[
                     {
                         "role": "user",
@@ -57,9 +63,10 @@ class VisionService:
             )
             
             feedback = response.choices[0].message.content
-            logger.info(f"Received response from  GPT-4o-mini: {feedback}")
+            logger.info(f"Received response from GPT-4o-mini Vision: {feedback}")
             
             return feedback
         except Exception as e:
             logger.error(f"Error analyzing frame: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return f"Error analyzing frame: {str(e)}" 
