@@ -9,6 +9,7 @@ from app.managers.connection import ConnectionManager
 from app.services.vision import VisionService
 from app.api.routes.websocket import WebSocketRouter
 from app.api.routes.users import UserRouter
+from app.api.routes.exercise import ExerciseRouter
 
 # Configure logging
 logging.basicConfig(
@@ -39,9 +40,11 @@ vision_service = VisionService()
 # Initialize routers
 websocket_router = WebSocketRouter(connection_manager, vision_service)
 user_router = UserRouter(connection_manager)
+exercise_router = ExerciseRouter(vision_service)
 
 # Add routes
 app.include_router(user_router.router)
+app.include_router(exercise_router.router)
 
 @app.websocket("/ws/exercise-analysis/{client_id}")
 async def websocket_endpoint(
